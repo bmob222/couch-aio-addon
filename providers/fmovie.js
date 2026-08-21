@@ -81,18 +81,21 @@ async function resolveTitle(siteKey, slug) {
 
 // --- streams: build embed URLs. Works from either a site slug id OR a raw
 //     imdb id (Stremio's /stream/movie/tt... request). -------------------------
-function buildEmbedStreams({ imdb, tmdb }, type, season, episode, sourceLabel) {
+function buildEmbedStreams({ imdb, tmdb, contentTitle }, type, season, episode, sourceLabel) {
   const out = [];
+  const epTag = type === 'series' ? ` · S${season}E${episode}` : '';
   for (const p of EMBEDS) {
     const id = p.key === 'tmdb' ? tmdb : imdb;
     if (!id) continue;
     const url = type === 'series' ? p.tv(id, season, episode) : p.movie(id);
     out.push({
-      // externalUrl: opens the embed page. The Couch app / a resolver can also
-      // consume `url` directly. Labeled so the user can pick a working host.
+      // externalUrl: opens the embed page in a browser. These hosts are signed-JS
+      // players (no direct file), so they're offered as external links, labeled by
+      // host so the user can pick one — a headless resolver would be needed to turn
+      // them into an in-app stream.
       externalUrl: url,
-      name: `AIO · ${sourceLabel || 'Embed'}`,
-      title: `${p.label}${type === 'series' ? ` · S${season}E${episode}` : ''}`,
+      name: 'Couch AIO',
+      title: `${contentTitle ? contentTitle + '\n' : ''}${p.label}${epTag} · Embed (opens externally)`,
       behaviorHints: { notWebReady: true },
     });
   }
@@ -111,7 +114,7 @@ async function streams(id) {
   const [siteKey, type, slug, s, e] = id.split(':');
   const ids = await resolveTitle(siteKey, slug);
   if (!ids || (!ids.imdb && !ids.tmdb)) return [];
-  return buildEmbedStreams(ids, type, s || 1, e || 1, SITES[siteKey]?.name);
+  return buildEmbedStreams({ ...ids, contentTitle: ids.title }, type, s || 1, e || 1, SITES[siteKey]?.name);
 }
 
 async function meta(id) {
