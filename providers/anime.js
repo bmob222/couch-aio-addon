@@ -216,50 +216,64 @@ function parseServers(frag) {
   return servers;
 }
 
-async function anisugeStreams(slug, episodeId, knownAnimeId, host) {
+// Read the top RESOLUTION from a master m3u8 for a quality label (e.g. "1080p").
+async function maxQuality(m3u8, ref) {
+  try {
+    const txt = await getText(m3u8, { headers: { Referer: ref, Origin: new URL(ref).origin } });
+    let best = 0;
+    const re = /RESOLUTION=\d+x(\d+)/g;
+    let m;
+    while ((m = re.exec(txt))) best = Math.max(best, parseInt(m[1], 10));
+    return best ? `${best}p` : 'HLS';
+  } catch (e) { return 'HLS'; }
+}
+
+async function anisugeStreams(slug, episodeId, knownAnimeId, host, label) {
   const out = [];
   const blob = await anisugeEpisodeBlob(slug, episodeId, knownAnimeId);
   if (!blob) return out;
   const sl = await getJson(`${AS}/ajax/server/list?servers=${encodeURIComponent(blob)}`, { headers: AJAX }).catch(() => null);
   const servers = parseServers((sl && sl.result) || '');
-  // Resolve up to 5 servers; de-dupe m3u8s.
+  // Resolve at least one server PER type (sub AND dub) so the user can pick.
+  const byType = { sub: [], dub: [] };
+  for (const sv of servers) (byType[sv.type] || byType.sub).push(sv);
   const seen = new Set();
-  for (const sv of servers.slice(0, 5)) {
-    const r = await getJson(`${AS}/ajax/server?get=${encodeURIComponent(sv.linkId)}`, { headers: AJAX }).catch(() => null);
-    const embed = r && r.result && (r.result.url || r.result.link);
-    if (!embed) continue;
-    const resolved = await resolveEmbed(embed);
-    if (resolved && resolved.m3u8 && !seen.has(resolved.m3u8)) {
-      seen.add(resolved.m3u8);
-      // The m3u8 CDN is referer-gated to the EMBED host (e.g. vidtube.site), not
-      // anisuge. Route it through OUR /proxy so the player needs no special
-      // headers — the proxy injects the Referer and rewrites segment URLs back
-      // through itself. If we don't know our own host (shouldn't happen), fall
-      // back to a direct URL + proxyHeaders for clients that honor them.
-      const ref = (resolved.host || AS) + '/';
-      const proxied = (u) => (host ? `${host}/proxy?u=${encodeURIComponent(u)}&r=${encodeURIComponent(ref)}` : u);
-      const stream = {
-        url: proxied(resolved.m3u8),
-        name: `Anisuge · ${sv.type.toUpperCase()}`,
-        title: 'HLS',
-        behaviorHints: { notWebReady: false },
-      };
-      if (!host) {
-        stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { Referer: ref, Origin: resolved.host || AS } } };
+
+  const resolveType = async (type) => {
+    for (const sv of (byType[type] || []).slice(0, 3)) {
+      const r = await getJson(`${AS}/ajax/server?get=${encodeURIComponent(sv.linkId)}`, { headers: AJAX }).catch(() => null);
+      const embed = r && r.result && (r.result.url || r.result.link);
+      if (!embed) continue;
+      const resolved = await resolveEmbed(embed);
+      if (resolved && resolved.m3u8 && !seen.has(resolved.m3u8)) {
+        seen.add(resolved.m3u8);
+        const ref = (resolved.host || AS) + '/';
+        const proxied = (u) => (host ? `${host}/proxy?u=${encodeURIComponent(u)}&r=${encodeURIComponent(ref)}` : u);
+        const quality = await maxQuality(resolved.m3u8, ref);
+        const tag = type === 'dub' ? 'DUB' : 'SUB';
+        const stream = {
+          url: proxied(resolved.m3u8),
+          name: `Couch AIO\nAnisuge ${tag}`,
+          // Descriptive title: episode label + quality + audio track.
+          title: `${label ? label + '\n' : ''}${quality} · ${tag === 'DUB' ? 'English Dub' : 'Japanese + Subs'}`,
+          behaviorHints: { notWebReady: false, bingeGroup: `couch-aio-${slug}-${tag.toLowerCase()}` },
+        };
+        if (!host) stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { Referer: ref, Origin: resolved.host || AS } } };
+        const subs = (resolved.tracks || [])
+          .filter((t) => t && t.file && /\.(vtt|srt|ass)(\?|$)/i.test(t.file) && (t.kind || '').toLowerCase() !== 'thumbnails')
+          .map((t, i) => ({ id: `as-${type}-${i}`, url: proxied(t.file), lang: subLang(t.label || t.language) }));
+        // English first so players that pick the first track default to English.
+        subs.sort((a, b) => (a.lang === 'eng' ? -1 : 0) - (b.lang === 'eng' ? -1 : 0));
+        if (subs.length) stream.subtitles = subs;
+        return stream;
       }
-      // Embedded soft-subtitles from getSources (English .vtt etc.). Proxy them
-      // too — the subtitle CDN is referer-gated like the video. Stremio reads a
-      // stream-level `subtitles` array of { id, url, lang }.
-      const subs = (resolved.tracks || [])
-        .filter((t) => t && t.file && /\.(vtt|srt|ass)(\?|$)/i.test(t.file) && (t.kind || '').toLowerCase() !== 'thumbnails')
-        .map((t, i) => ({ id: `as-${sv.type}-${i}`, url: proxied(t.file), lang: subLang(t.label || t.language) }));
-      if (subs.length) stream.subtitles = subs;
-      out.push(stream);
-    } else if (!resolved) {
-      out.push({ externalUrl: embed, name: `Anisuge · ${sv.type.toUpperCase()}`, title: 'embed', behaviorHints: { notWebReady: true } });
     }
-    if (out.length >= 4) break;
-  }
+    return null;
+  };
+
+  const [subStream, dubStream] = await Promise.all([resolveType('sub'), resolveType('dub')]);
+  if (subStream) out.push(subStream);
+  if (dubStream) out.push(dubStream);
   return out;
 }
 
@@ -350,7 +364,8 @@ async function imdbStreams(type, tt, season, episode, host) {
   const wantEp = type === 'movie' ? 1 : (episode || 1);
   const ep = (info.episodes || []).find((e) => e.number === wantEp) || (info.episodes || [])[wantEp - 1];
   if (!ep) return [];
-  return anisugeStreams(best.slug, ep.id, info.animeId, host);
+  const label = type === 'movie' ? name : `${name} · E${wantEp}${ep.title && !/^episode\b/i.test(ep.title) ? ` · ${ep.title}` : ''}`;
+  return anisugeStreams(best.slug, ep.id, info.animeId, host, label);
 }
 
 module.exports = { CATALOGS, handlesCatalog, catalog, meta, streams, imdbStreams };
