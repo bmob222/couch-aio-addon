@@ -182,6 +182,19 @@ async function anisugeEpisodeBlob(slug, episodeId, knownAnimeId) {
   });
 }
 
+// Map a track label to an ISO-639 code Stremio expects.
+function subLang(label) {
+  const l = (label || '').toLowerCase();
+  if (l.includes('english') || l === 'en' || l === 'eng') return 'eng';
+  if (l.includes('spanish')) return 'spa';
+  if (l.includes('portug')) return 'por';
+  if (l.includes('french')) return 'fre';
+  if (l.includes('german')) return 'ger';
+  if (l.includes('arabic')) return 'ara';
+  if (l.includes('italian')) return 'ita';
+  return l.slice(0, 3) || 'eng';
+}
+
 // Parse the /ajax/server/list fragment into { type, linkId } server rows.
 function parseServers(frag) {
   const servers = [];
@@ -224,11 +237,9 @@ async function anisugeStreams(slug, episodeId, knownAnimeId, host) {
       // through itself. If we don't know our own host (shouldn't happen), fall
       // back to a direct URL + proxyHeaders for clients that honor them.
       const ref = (resolved.host || AS) + '/';
-      const playUrl = host
-        ? `${host}/proxy?u=${encodeURIComponent(resolved.m3u8)}&r=${encodeURIComponent(ref)}`
-        : resolved.m3u8;
+      const proxied = (u) => (host ? `${host}/proxy?u=${encodeURIComponent(u)}&r=${encodeURIComponent(ref)}` : u);
       const stream = {
-        url: playUrl,
+        url: proxied(resolved.m3u8),
         name: `Anisuge · ${sv.type.toUpperCase()}`,
         title: 'HLS',
         behaviorHints: { notWebReady: false },
@@ -236,6 +247,13 @@ async function anisugeStreams(slug, episodeId, knownAnimeId, host) {
       if (!host) {
         stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { Referer: ref, Origin: resolved.host || AS } } };
       }
+      // Embedded soft-subtitles from getSources (English .vtt etc.). Proxy them
+      // too — the subtitle CDN is referer-gated like the video. Stremio reads a
+      // stream-level `subtitles` array of { id, url, lang }.
+      const subs = (resolved.tracks || [])
+        .filter((t) => t && t.file && /\.(vtt|srt|ass)(\?|$)/i.test(t.file) && (t.kind || '').toLowerCase() !== 'thumbnails')
+        .map((t, i) => ({ id: `as-${sv.type}-${i}`, url: proxied(t.file), lang: subLang(t.label || t.language) }));
+      if (subs.length) stream.subtitles = subs;
       out.push(stream);
     } else if (!resolved) {
       out.push({ externalUrl: embed, name: `Anisuge · ${sv.type.toUpperCase()}`, title: 'embed', behaviorHints: { notWebReady: true } });
