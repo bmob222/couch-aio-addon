@@ -203,13 +203,13 @@ function parseServers(frag) {
   return servers;
 }
 
-async function anisugeStreams(slug, episodeId, knownAnimeId) {
+async function anisugeStreams(slug, episodeId, knownAnimeId, host) {
   const out = [];
   const blob = await anisugeEpisodeBlob(slug, episodeId, knownAnimeId);
   if (!blob) return out;
   const sl = await getJson(`${AS}/ajax/server/list?servers=${encodeURIComponent(blob)}`, { headers: AJAX }).catch(() => null);
   const servers = parseServers((sl && sl.result) || '');
-  // Resolve up to 3 servers; de-dupe m3u8s.
+  // Resolve up to 5 servers; de-dupe m3u8s.
   const seen = new Set();
   for (const sv of servers.slice(0, 5)) {
     const r = await getJson(`${AS}/ajax/server?get=${encodeURIComponent(sv.linkId)}`, { headers: AJAX }).catch(() => null);
@@ -218,19 +218,25 @@ async function anisugeStreams(slug, episodeId, knownAnimeId) {
     const resolved = await resolveEmbed(embed);
     if (resolved && resolved.m3u8 && !seen.has(resolved.m3u8)) {
       seen.add(resolved.m3u8);
-      // The m3u8 CDN is referer-gated to the EMBED host (e.g. vidtube.site),
-      // not to anisuge — attach proxyHeaders so the Stremio player sends the
-      // right Referer/Origin. notWebReady:true tells Stremio to proxy them.
+      // The m3u8 CDN is referer-gated to the EMBED host (e.g. vidtube.site), not
+      // anisuge. Route it through OUR /proxy so the player needs no special
+      // headers — the proxy injects the Referer and rewrites segment URLs back
+      // through itself. If we don't know our own host (shouldn't happen), fall
+      // back to a direct URL + proxyHeaders for clients that honor them.
       const ref = (resolved.host || AS) + '/';
-      out.push({
-        url: resolved.m3u8,
+      const playUrl = host
+        ? `${host}/proxy?u=${encodeURIComponent(resolved.m3u8)}&r=${encodeURIComponent(ref)}`
+        : resolved.m3u8;
+      const stream = {
+        url: playUrl,
         name: `Anisuge · ${sv.type.toUpperCase()}`,
         title: 'HLS',
-        behaviorHints: {
-          notWebReady: true,
-          proxyHeaders: { request: { Referer: ref, Origin: resolved.host || AS } },
-        },
-      });
+        behaviorHints: { notWebReady: false },
+      };
+      if (!host) {
+        stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { Referer: ref, Origin: resolved.host || AS } } };
+      }
+      out.push(stream);
     } else if (!resolved) {
       out.push({ externalUrl: embed, name: `Anisuge · ${sv.type.toUpperCase()}`, title: 'embed', behaviorHints: { notWebReady: true } });
     }
@@ -239,14 +245,14 @@ async function anisugeStreams(slug, episodeId, knownAnimeId) {
   return out;
 }
 
-async function streams(id) {
-  const parts = id.split(':'); // anime:as:<slug>:<episodeId>
+async function streams(id, host) {
+  const parts = id.split(':'); // anime:as:<slug>~<animeId>:<episodeId>
   const ns = parts[1];
   if (ns === 'as') {
     const [slug, animeId] = parts[2].split('~');
     const episodeId = parts[3];
     if (!episodeId) return [];
-    return anisugeStreams(slug, episodeId, animeId);
+    return anisugeStreams(slug, episodeId, animeId, host);
   }
   return []; // anime.nexus streams are CF-gated; not served in v1.
 }
