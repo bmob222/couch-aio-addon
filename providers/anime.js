@@ -257,4 +257,82 @@ async function streams(id, host) {
   return []; // anime.nexus streams are CF-gated; not served in v1.
 }
 
-module.exports = { CATALOGS, handlesCatalog, catalog, meta, streams };
+// --- tt / kitsu resolver: the app plays anime from its OWN library, keyed by an
+// IMDB (tt) id, not our anime:as: catalog id — so /stream/series/tt…:S:E lands
+// here. Resolve tt → title (Cinemeta) → anisuge search → episode → HLS. Returns
+// [] when no confident title match, so non-anime tt requests aren't polluted.
+function normalizeTitle(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+async function cinemetaName(type, tt) {
+  const j = await getJson(`https://v3-cinemeta.strem.io/meta/${type}/${tt}.json`, {
+    headers: { Referer: 'https://www.stremio.com/' },
+  }).catch(() => null);
+  return j && j.meta && j.meta.name;
+}
+
+// Parse the /ajax/anime/search result.html into rich cards carrying every title
+// variant (English .name, romaji data-jp, and .subname aliases) so a tt lookup
+// can match across languages.
+function parseAnisugeSearch(html) {
+  const out = [];
+  const re = /<a class="item" href="(?:https?:\/\/[^/]+)?\/watch\/([^"?#]+?)"[\s\S]*?data-jp="([^"]*)"[^>]*>([^<]*)<\/div>\s*(?:<div class="subname">([^<]*)<\/div>)?/g;
+  let m;
+  const seen = new Set();
+  while ((m = re.exec(html)) && out.length < 20) {
+    const slug = m[1].replace(/\/ep-\d+.*$/, '');
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    out.push({ slug, jp: m[2] || '', name: (m[3] || '').trim(), subname: m[4] || '' });
+  }
+  return out;
+}
+
+// Word-overlap match — robust to romanization spacing ("Ittekara" vs "Itte
+// kara"), punctuation, and English-vs-romaji (one variant will hit). Matches when
+// a variant is a substring OR shares ≥60% of the shorter title's significant words.
+function titleMatches(target, card) {
+  const t = normalizeTitle(target);
+  const tWords = new Set(t.split(' ').filter((w) => w.length >= 2));
+  const variants = [card.name, card.jp, ...(card.subname || '').split(';')].map(normalizeTitle).filter(Boolean);
+  return variants.some((v) => {
+    if (v === t || v.includes(t) || t.includes(v)) return true;
+    const vWords = new Set(v.split(' ').filter((w) => w.length >= 2));
+    if (!vWords.size || !tWords.size) return false;
+    let shared = 0;
+    for (const w of vWords) if (tWords.has(w)) shared++;
+    return shared / Math.min(vWords.size, tWords.size) >= 0.6;
+  });
+}
+
+async function anisugeSearchCards(keyword) {
+  const j = await getJson(`${AS}/ajax/anime/search?keyword=${encodeURIComponent(keyword)}`, { headers: AJAX }).catch(() => null);
+  const html = (j && j.result && (j.result.html || j.result)) || '';
+  return parseAnisugeSearch(typeof html === 'string' ? html : '');
+}
+
+async function imdbStreams(type, tt, season, episode, host) {
+  const name = await cinemetaName(type, tt);
+  if (!name) return [];
+  // anisuge's search chokes on very long/punctuated titles → try the full title,
+  // then progressively shorter keyword prefixes (5 then 3 significant words).
+  const words = name.replace(/[.,:;!?]/g, ' ').split(/\s+/).filter(Boolean);
+  const attempts = [name, words.slice(0, 5).join(' '), words.slice(0, 3).join(' ')];
+  let cards = [];
+  for (const kw of attempts) {
+    cards = await anisugeSearchCards(kw);
+    if (cards.some((c) => titleMatches(name, c))) break;
+  }
+  if (!cards.length) return [];
+  // Match Cinemeta's title against any anisuge title variant (EN/romaji/alias).
+  const best = cards.find((c) => titleMatches(name, c));
+  if (!best) return [];
+  const info = await anisugeEpisodes(best.slug);
+  const wantEp = type === 'movie' ? 1 : (episode || 1);
+  const ep = (info.episodes || []).find((e) => e.number === wantEp) || (info.episodes || [])[wantEp - 1];
+  if (!ep) return [];
+  return anisugeStreams(best.slug, ep.id, info.animeId, host);
+}
+
+module.exports = { CATALOGS, handlesCatalog, catalog, meta, streams, imdbStreams };
