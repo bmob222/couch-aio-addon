@@ -252,19 +252,25 @@ async function anisugeStreams(slug, episodeId, knownAnimeId, host, label) {
         const proxied = (u) => (host ? proxUrl(host, u, ref) : u);
         const quality = await maxQuality(resolved.m3u8, ref);
         const tag = type === 'dub' ? 'DUB' : 'SUB';
+        const rawSubs = (resolved.tracks || [])
+          .filter((t) => t && t.file && /\.(vtt|srt|ass)(\?|$)/i.test(t.file) && (t.kind || '').toLowerCase() !== 'thumbnails')
+          .map((t, i) => ({ id: `as-${type}-${i}`, file: t.file, lang: subLang(t.label || t.language), name: t.label || t.language }));
+        // English first so players that pick the first track default to English.
+        rawSubs.sort((a, b) => (a.lang === 'eng' ? -1 : 0) - (b.lang === 'eng' ? -1 : 0));
         const stream = {
-          url: proxied(resolved.m3u8),
+          // Subs ride inside the master playlist as native HLS renditions
+          // (injected by /proxy) — clients that ignore Stremio stream-level
+          // `subtitles` still get selectable subtitle tracks.
+          url: host
+            ? proxUrl(host, resolved.m3u8, ref, { subs: rawSubs.map((s) => ({ url: s.file, lang: s.lang, name: s.name })) })
+            : resolved.m3u8,
           name: `Couch AIO\nAnisuge ${tag}`,
           // Descriptive title: episode label + quality + audio track.
           title: `${label ? label + '\n' : ''}${quality} · ${tag === 'DUB' ? 'English Dub' : 'Japanese + Subs'}`,
           behaviorHints: { notWebReady: false, bingeGroup: `couch-aio-${slug}-${tag.toLowerCase()}` },
         };
         if (!host) stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { Referer: ref, Origin: resolved.host || AS } } };
-        const subs = (resolved.tracks || [])
-          .filter((t) => t && t.file && /\.(vtt|srt|ass)(\?|$)/i.test(t.file) && (t.kind || '').toLowerCase() !== 'thumbnails')
-          .map((t, i) => ({ id: `as-${type}-${i}`, url: proxied(t.file), lang: subLang(t.label || t.language) }));
-        // English first so players that pick the first track default to English.
-        subs.sort((a, b) => (a.lang === 'eng' ? -1 : 0) - (b.lang === 'eng' ? -1 : 0));
+        const subs = rawSubs.map((s) => ({ id: s.id, url: proxied(s.file), lang: s.lang }));
         if (subs.length) stream.subtitles = subs;
         return stream;
       }
