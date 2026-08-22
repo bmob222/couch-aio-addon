@@ -10,6 +10,7 @@
 //   anime:nx:<uuid>:<slug>           → anime.nexus catalog item (meta best-effort)
 const { getText, getJson } = require('../lib/http');
 const cache = require('../lib/cache');
+const { proxUrl } = require('../lib/proxy');
 
 const AS = 'https://anisuge.tv';
 const NX = 'https://api.anime.nexus';
@@ -248,7 +249,7 @@ async function anisugeStreams(slug, episodeId, knownAnimeId, host, label) {
       if (resolved && resolved.m3u8 && !seen.has(resolved.m3u8)) {
         seen.add(resolved.m3u8);
         const ref = (resolved.host || AS) + '/';
-        const proxied = (u) => (host ? `${host}/proxy?u=${encodeURIComponent(u)}&r=${encodeURIComponent(ref)}` : u);
+        const proxied = (u) => (host ? proxUrl(host, u, ref) : u);
         const quality = await maxQuality(resolved.m3u8, ref);
         const tag = type === 'dub' ? 'DUB' : 'SUB';
         const stream = {

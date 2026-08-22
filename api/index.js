@@ -22,7 +22,7 @@ module.exports = async (req, res) => {
     return res.end(landing(host));
   }
 
-  if (path === '/proxy') {
+  if (path === '/proxy' || path.startsWith('/proxy/')) {
     res.__range = req.headers.range;
     // Node res on Vercel supports writeHead/setHeader/end like http.ServerResponse.
     if (!res.writeHead) res.writeHead = (s) => { res.statusCode = s; };
