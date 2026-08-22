@@ -98,6 +98,21 @@ function embedUrls({ imdb, tmdb }, type, season, episode) {
 
 // How many embed hosts to drive through the headless resolver per request.
 const RESOLVE_HOSTS = parseInt(process.env.RESOLVE_HOSTS || '3', 10);
+// Embed pages can't play inside the Couch app (externalUrl rows always fail
+// there), so they're off unless explicitly re-enabled for web/desktop Stremio.
+const INCLUDE_EMBEDS = process.env.INCLUDE_EMBEDS === '1';
+
+// Top RESOLUTION from a master m3u8 → "1080p" label (mirrors anime.maxQuality).
+async function hlsQuality(m3u8, ref) {
+  try {
+    const txt = await getText(m3u8, { headers: { Referer: ref, Origin: new URL(ref).origin } });
+    let best = 0;
+    const re = /RESOLUTION=\d+x(\d+)/g;
+    let m;
+    while ((m = re.exec(txt))) best = Math.max(best, parseInt(m[1], 10));
+    return best ? `${best}p` : 'HLS';
+  } catch (e) { return 'HLS'; }
+}
 
 async function buildEmbedStreams({ imdb, tmdb, contentTitle }, type, season, episode, sourceLabel, host) {
   const epTag = type === 'series' ? ` · S${season}E${episode}` : '';
@@ -106,36 +121,33 @@ async function buildEmbedStreams({ imdb, tmdb, contentTitle }, type, season, epi
 
   // With a local headless resolver configured, drive the top hosts in parallel
   // and turn captured m3u8s into directly playable streams relayed through our
-  // referer-injecting /proxy. Hosts that fail stay as external embed links.
-  const resolved = new Map();
+  // referer-injecting /proxy.
+  const playable = [];
   if (resolver.enabled() && host) {
     const targets = embeds.slice(0, RESOLVE_HOSTS);
     const hits = await Promise.all(targets.map((e) => resolver.resolveEmbed(e.url)));
-    targets.forEach((e, i) => { if (hits[i]) resolved.set(e.url, hits[i]); });
-  }
-
-  const playable = [];
-  const external = [];
-  for (const e of embeds) {
-    const hit = resolved.get(e.url);
-    if (hit) {
+    const qualities = await Promise.all(hits.map((h) => (h ? hlsQuality(h.url, h.referer) : null)));
+    targets.forEach((e, i) => {
+      const hit = hits[i];
+      if (!hit) return;
       playable.push({
         url: proxUrl(host, hit.url, hit.referer),
-        name: 'Couch AIO',
-        title: `${prefix}${e.label}${epTag} · HLS`,
-        behaviorHints: { notWebReady: true },
+        name: `Couch AIO\n${e.label}`,
+        title: `${prefix}${e.label}${epTag} · ${qualities[i]}`,
+        behaviorHints: { notWebReady: false, bingeGroup: `couch-aio-${e.label.toLowerCase()}` },
       });
-    } else {
-      external.push({
-        // externalUrl: opens the embed page in a browser — fallback when no
-        // resolver is running (serverless deploy) or the host didn't resolve.
-        externalUrl: e.url,
-        name: 'Couch AIO',
-        title: `${prefix}${e.label}${epTag} · Embed (opens externally)`,
-        behaviorHints: { notWebReady: true },
-      });
-    }
+    });
   }
+  if (!INCLUDE_EMBEDS) return playable;
+
+  const external = embeds
+    .filter((e) => !playable.some((p) => p.title.includes(e.label)))
+    .map((e) => ({
+      externalUrl: e.url,
+      name: 'Couch AIO',
+      title: `${prefix}${e.label}${epTag} · Embed (opens externally)`,
+      behaviorHints: { notWebReady: true },
+    }));
   return [...playable, ...external];
 }
 
