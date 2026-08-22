@@ -15,6 +15,7 @@ const { proxUrl } = require('../lib/proxy');
 const SITES = {
   ramoflix: { base: 'https://ramoflix.net', name: 'Ramoflix' },
   wmovies: { base: 'https://wmovies.org', name: 'WMovies' },
+  doraby: { base: 'https://doraby.com', name: 'Doraby' },
 };
 
 // Embed hosts keyed by IMDB (tt) or TMDB id. `key` picks which id to inject.
