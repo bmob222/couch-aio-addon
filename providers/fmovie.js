@@ -8,6 +8,8 @@
 // /stream request, movie/series streams can be built with NO scraping at all.
 const { getText } = require('../lib/http');
 const cache = require('../lib/cache');
+const resolver = require('../lib/resolver');
+const { proxUrl } = require('../lib/proxy');
 
 // Per-instance site config.
 const SITES = {
@@ -17,13 +19,16 @@ const SITES = {
 
 // Embed hosts keyed by IMDB (tt) or TMDB id. `key` picks which id to inject.
 // order = display priority. These are the same public providers both sites use.
+// Order = resolver priority: hosts verified to yield m3u8 in headless Chromium
+// first (MoviesAPI/111Movies/Videasy, Aug 2026); VidFast CF-blocks headless so
+// it sits last (still offered as an external embed link).
 const EMBEDS = [
-  { label: 'Videasy',   key: 'tmdb', movie: (id) => `https://player.videasy.net/movie/${id}`,          tv: (id, s, e) => `https://player.videasy.net/tv/${id}/${s}/${e}` },
-  { label: 'VidFast',   key: 'tmdb', movie: (id) => `https://vidfast.pro/movie/${id}`,                  tv: (id, s, e) => `https://vidfast.pro/tv/${id}/${s}/${e}` },
   { label: 'MoviesAPI', key: 'imdb', movie: (id) => `https://moviesapi.to/movie/${id}`,                 tv: (id, s, e) => `https://moviesapi.to/tv/${id}-${s}-${e}` },
-  { label: 'Soap2Night',key: 'imdb', movie: (id) => `https://soap2night.site/embed/movie/${id}`,        tv: (id, s, e) => `https://soap2night.site/embed/tv/${id}/${s}/${e}` },
   { label: '111Movies', key: 'imdb', movie: (id) => `https://111movies.com/movie/${id}`,                tv: (id, s, e) => `https://111movies.com/tv/${id}/${s}/${e}` },
+  { label: 'Videasy',   key: 'tmdb', movie: (id) => `https://player.videasy.net/movie/${id}`,          tv: (id, s, e) => `https://player.videasy.net/tv/${id}/${s}/${e}` },
+  { label: 'Soap2Night',key: 'imdb', movie: (id) => `https://soap2night.site/embed/movie/${id}`,        tv: (id, s, e) => `https://soap2night.site/embed/tv/${id}/${s}/${e}` },
   { label: 'VidZee',    key: 'imdb', movie: (id) => `https://player.vidzee.wtf/embed/movie/${id}`,      tv: (id, s, e) => `https://player.vidzee.wtf/embed/tv/${id}/${s}/${e}` },
+  { label: 'VidFast',   key: 'tmdb', movie: (id) => `https://vidfast.pro/movie/${id}`,                  tv: (id, s, e) => `https://vidfast.pro/tv/${id}/${s}/${e}` },
 ];
 
 // --- catalog: scrape a category page -----------------------------------------
@@ -81,40 +86,72 @@ async function resolveTitle(siteKey, slug) {
 
 // --- streams: build embed URLs. Works from either a site slug id OR a raw
 //     imdb id (Stremio's /stream/movie/tt... request). -------------------------
-function buildEmbedStreams({ imdb, tmdb, contentTitle }, type, season, episode, sourceLabel) {
+function embedUrls({ imdb, tmdb }, type, season, episode) {
   const out = [];
-  const epTag = type === 'series' ? ` · S${season}E${episode}` : '';
   for (const p of EMBEDS) {
     const id = p.key === 'tmdb' ? tmdb : imdb;
     if (!id) continue;
-    const url = type === 'series' ? p.tv(id, season, episode) : p.movie(id);
-    out.push({
-      // externalUrl: opens the embed page in a browser. These hosts are signed-JS
-      // players (no direct file), so they're offered as external links, labeled by
-      // host so the user can pick one — a headless resolver would be needed to turn
-      // them into an in-app stream.
-      externalUrl: url,
-      name: 'Couch AIO',
-      title: `${contentTitle ? contentTitle + '\n' : ''}${p.label}${epTag} · Embed (opens externally)`,
-      behaviorHints: { notWebReady: true },
-    });
+    out.push({ label: p.label, url: type === 'series' ? p.tv(id, season, episode) : p.movie(id) });
   }
   return out;
+}
+
+// How many embed hosts to drive through the headless resolver per request.
+const RESOLVE_HOSTS = parseInt(process.env.RESOLVE_HOSTS || '3', 10);
+
+async function buildEmbedStreams({ imdb, tmdb, contentTitle }, type, season, episode, sourceLabel, host) {
+  const epTag = type === 'series' ? ` · S${season}E${episode}` : '';
+  const embeds = embedUrls({ imdb, tmdb }, type, season, episode);
+  const prefix = contentTitle ? contentTitle + '\n' : '';
+
+  // With a local headless resolver configured, drive the top hosts in parallel
+  // and turn captured m3u8s into directly playable streams relayed through our
+  // referer-injecting /proxy. Hosts that fail stay as external embed links.
+  const resolved = new Map();
+  if (resolver.enabled() && host) {
+    const targets = embeds.slice(0, RESOLVE_HOSTS);
+    const hits = await Promise.all(targets.map((e) => resolver.resolveEmbed(e.url)));
+    targets.forEach((e, i) => { if (hits[i]) resolved.set(e.url, hits[i]); });
+  }
+
+  const playable = [];
+  const external = [];
+  for (const e of embeds) {
+    const hit = resolved.get(e.url);
+    if (hit) {
+      playable.push({
+        url: proxUrl(host, hit.url, hit.referer),
+        name: 'Couch AIO',
+        title: `${prefix}${e.label}${epTag} · HLS`,
+        behaviorHints: { notWebReady: true },
+      });
+    } else {
+      external.push({
+        // externalUrl: opens the embed page in a browser — fallback when no
+        // resolver is running (serverless deploy) or the host didn't resolve.
+        externalUrl: e.url,
+        name: 'Couch AIO',
+        title: `${prefix}${e.label}${epTag} · Embed (opens externally)`,
+        behaviorHints: { notWebReady: true },
+      });
+    }
+  }
+  return [...playable, ...external];
 }
 
 // From a Stremio stream id. Two shapes:
 //  - `<site>:<type>:<slug>`         → scrape title page for ids
 //  - `tt1234567` / `tt1234567:1:2`  → build embeds straight from imdb id
-async function streams(id) {
+async function streams(id, host) {
   if (id.startsWith('tt')) {
     const [imdb, s, e] = id.split(':');
     const type = s ? 'series' : 'movie';
-    return buildEmbedStreams({ imdb, tmdb: null }, type, s, e, 'Embed');
+    return buildEmbedStreams({ imdb, tmdb: null }, type, s, e, 'Embed', host);
   }
   const [siteKey, type, slug, s, e] = id.split(':');
   const ids = await resolveTitle(siteKey, slug);
   if (!ids || (!ids.imdb && !ids.tmdb)) return [];
-  return buildEmbedStreams({ ...ids, contentTitle: ids.title }, type, s || 1, e || 1, SITES[siteKey]?.name);
+  return buildEmbedStreams({ ...ids, contentTitle: ids.title }, type, s || 1, e || 1, SITES[siteKey]?.name, host);
 }
 
 async function meta(id) {

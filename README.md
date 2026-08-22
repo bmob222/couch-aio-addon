@@ -48,6 +48,28 @@ docker build -t couch-aio . && docker run -p 7700:7700 couch-aio
 node lib/server.js
 ```
 
+
+## Movie/TV resolver (optional, self-hosted — makes movies directly playable)
+
+The public embed hosts (MoviesAPI, 111Movies, Videasy, Soap2Night, ...) are
+signed-JS players — the real HLS URL only exists after the player script runs.
+`resolver/` is a small companion service that drives them in headless Chromium,
+sniffs the master `.m3u8` + its Referer, and hands it back to the addon, which
+serves it through its referer-injecting `/proxy` as a directly playable stream.
+
+```bash
+cd resolver && npm install        # installs Playwright + Chromium
+PORT=7799 node server.js          # resolver
+# in another shell:
+RESOLVER_URL=http://localhost:7799 PORT=7700 node lib/server.js
+```
+
+With `RESOLVER_URL` set, `/stream` for movies/TV returns playable `HLS` streams
+(top hosts resolved in parallel, ~3-20s cold, instant cached) plus the remaining
+hosts as external embed links. Without it (e.g. serverless deploy), movie streams
+fall back to external embed links only. It needs a real box (Mac/mini/NAS) — it
+can't run on free serverless.
+
 ## Test
 ```bash
 npm test           # live smoke test against every source (14 checks)
@@ -63,8 +85,9 @@ npm test           # live smoke test against every source (14 checks)
 
 ## Notes / limits
 
-- Embed-based movie sources open the provider page (`externalUrl`); a downstream
-  resolver (or the Couch app's) turns them into a direct file. Anime is direct HLS.
+- Without the self-hosted resolver, embed-based movie sources open the provider
+  page (`externalUrl`). With it, they become directly playable HLS. Anime is
+  always direct HLS. VidFast Cloudflare-blocks headless browsers (embed-only).
 - Sites change markup; providers are defensive (fallbacks + try/catch) but a
   parser may need a nudge when a site redesigns.
 - No affiliation with any listed site. Scrapes public pages only.

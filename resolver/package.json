@@ -1,0 +1,14 @@
+{
+  "name": "couch-aio-resolver",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless-browser stream resolver for Couch AIO: opens signed-JS embed players and captures the real HLS URL from the network.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "postinstall": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}
