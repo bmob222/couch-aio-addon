@@ -46,7 +46,10 @@ async function req(path) {
     log(!!(s && s.ytId), 'stream: GlobeTV', s && s.ytId ? `ytId=${s.ytId}` : 'no ytId');
   }
 
-  // 4. IMDB → embed sources (no scrape; pure reconstruction)
+  // 4. IMDB → embed sources (no scrape; pure reconstruction). Playable HLS
+  // needs a running resolver (see resolver/); here we validate the embed-URL
+  // reconstruction with INCLUDE_EMBEDS so the test is resolver-independent.
+  process.env.INCLUDE_EMBEDS = '1';
   {
     const j = await req('stream/movie/tt1375666'); // Inception
     const n = (j.streams || []).length;
