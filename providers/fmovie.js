@@ -6,7 +6,7 @@
 // vidzee, cinesrc). We scrape category pages for catalogs and reconstruct the
 // embed URLs for streams. Because Stremio also hands us the `tt` id on a
 // /stream request, movie/series streams can be built with NO scraping at all.
-const { getText } = require('../lib/http');
+const { getText, getJson } = require('../lib/http');
 const cache = require('../lib/cache');
 const resolver = require('../lib/resolver');
 const { proxUrl } = require('../lib/proxy');
@@ -56,7 +56,7 @@ function pickPoster(imgTag) {
 // listing, not the title page), so meta for a browsed item can reuse it.
 const posterBySlug = new Map();
 
-function parseCatalogItems(html, site) {
+function parseCatalogItems(html, site, kind) {
   const items = [];
   const re = /<div id="post-(\d+)"[^>]*class="item[^"]*"[\s\S]*?<a href="([^"]+)"[\s\S]*?(<img[^>]*>)[\s\S]*?<div class="meta">([\s\S]*?)<\/div>/g;
   let m;
@@ -65,7 +65,10 @@ function parseCatalogItems(html, site) {
     const slug = href.replace(/^https?:\/\/[^/]+\//, '').replace(/\/$/, '');
     if (!slug || slug.startsWith('category') || slug.startsWith('genre')) continue;
     const yearM = metaBlock.match(/(19|20)\d{2}/);
-    const isTv = /SS\s*\d|EP\s*\d|Series/i.test(metaBlock);
+    // The catalog kind is authoritative (we fetched /category/tv-series or
+    // /movies); fall back to markup heuristics only when kind is unknown.
+    const isTv = kind === 'series' ? true : kind === 'movie' ? false
+      : /SS\s*\d|EP\s*\d|Series/i.test(metaBlock);
     // Prefer the img alt (clean title), then the meta anchor text, then slug.
     const altM = imgTag.match(/alt="([^"]+)"/);
     const anchorM = metaBlock.match(/<a[^>]*>([^<]+)<\/a>/);
@@ -91,7 +94,7 @@ async function catalog(siteKey, kind, { skip = 0 } = {}) {
   const url = `${site.base}/category/${path}/${page > 1 ? `page/${page}/` : ''}`;
   return cache.wrap(`${siteKey}:cat:${kind}:${page}`, 10 * 60 * 1000, async () => {
     const html = await getText(url);
-    return parseCatalogItems(html, siteKey);
+    return parseCatalogItems(html, siteKey, kind);
   });
 }
 
@@ -102,13 +105,16 @@ function extractIds(html) {
   const imdb = (html.match(/"(?:imdb_id|tvimdbid)"\s*:\s*"(tt\d+)"/) || [])[1];
   const tmdb = (html.match(/"(?:id|tvid)"\s*:\s*"(\d+)"/) || [])[1];
   const title = (html.match(/<h1[^>]*>([^<]+)<\/h1>/) || [])[1];
+  // TV pages expose the site's TMDB key + tv id — used to enumerate episodes.
+  const tvid = (html.match(/"tvid"\s*:\s*"(\d+)"/) || [])[1];
+  const tvapikey = (html.match(/"tvapikey"\s*:\s*"([0-9a-f]{32})"/) || [])[1];
   // Poster/background for meta: og:image, then the first non-placeholder poster.
   const og = (html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/) ||
               html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:image"/) || [])[1];
   const posterImg = (html.match(/<img[^>]*class="[^"]*poster[^"]*"[^>]*>/) ||
                      html.match(/class="poster"[\s\S]{0,200}?(<img[^>]*>)/) || [])[0];
   const poster = (og && !/^data:/.test(og) ? og : undefined) || (posterImg && pickPoster(posterImg));
-  return { imdb, tmdb, title: title && title.trim(), poster };
+  return { imdb, tmdb, title: title && title.trim(), poster, tvid, tvapikey };
 }
 
 async function resolveTitle(siteKey, slug) {
@@ -201,17 +207,56 @@ async function streams(id, host) {
   return buildEmbedStreams({ ...ids, contentTitle: ids.title }, type, s || 1, e || 1, SITES[siteKey]?.name, host);
 }
 
+// Enumerate a series' episodes from TMDB using the tv id + api key the fmovie
+// title page embeds. Returns Stremio `videos` [{id, season, episode, ...}] with
+// ids shaped `<site>:series:<slug>:<S>:<E>` so streams() can build embeds.
+async function seriesVideos(siteKey, slug, tvid, apiKey) {
+  if (!tvid || !apiKey) return [];
+  return cache.wrap(`${siteKey}:eps:${slug}`, 6 * 60 * 60 * 1000, async () => {
+    const base = 'https://api.themoviedb.org/3/tv/';
+    const show = await getJson(`${base}${tvid}?api_key=${apiKey}&language=en-US`).catch(() => null);
+    if (!show || !Array.isArray(show.seasons)) return [];
+    // Skip specials (season 0) unless it's the only season.
+    const seasonNums = show.seasons
+      .map((s) => s.season_number)
+      .filter((n) => Number.isInteger(n) && n > 0);
+    const nums = seasonNums.length ? seasonNums : [0];
+    const videos = [];
+    for (const n of nums) {
+      const sd = await getJson(`${base}${tvid}/season/${n}?api_key=${apiKey}&language=en-US`).catch(() => null);
+      for (const ep of (sd && sd.episodes) || []) {
+        const S = ep.season_number, E = ep.episode_number;
+        if (!Number.isInteger(S) || !Number.isInteger(E)) continue;
+        videos.push({
+          id: `${siteKey}:series:${slug}:${S}:${E}`,
+          title: ep.name || `Episode ${E}`,
+          season: S,
+          episode: E,
+          released: ep.air_date ? `${ep.air_date}T00:00:00.000Z` : undefined,
+          thumbnail: ep.still_path ? `https://image.tmdb.org/t/p/w300${ep.still_path}` : undefined,
+          overview: ep.overview || undefined,
+        });
+      }
+    }
+    return videos;
+  });
+}
+
 async function meta(id) {
   const [siteKey, type, slug] = id.split(':');
   const ids = await resolveTitle(siteKey, slug).catch(() => null);
   const poster = (ids && ids.poster) || posterBySlug.get(`${siteKey}:${slug}`);
-  return {
+  const m = {
     id,
     type,
     name: decodeEntities((ids && ids.title) || slug.replace(/-/g, ' ')),
     poster,
     background: poster,
   };
+  if (type === 'series' && ids) {
+    m.videos = await seriesVideos(siteKey, slug, ids.tvid || ids.tmdb, ids.tvapikey).catch(() => []);
+  }
+  return m;
 }
 
 module.exports = { SITES, catalog, meta, streams, buildEmbedStreams, EMBEDS };
