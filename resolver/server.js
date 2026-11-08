@@ -6,7 +6,7 @@
 // clicks play, and sniffs the network for the master .m3u8 + the Referer it
 // was fetched with, so the addon can hand Stremio a directly playable stream.
 //
-//   GET /resolve?u=<embedUrl>   → { url, referer, ms } | { err }
+//   GET /resolve?u=<embedUrl>   → { url, referer, headers, ms } | { err }
 //   GET /health                 → { ok, browser }
 //
 // Run: cd resolver && npm install && PORT=7799 node server.js
@@ -44,10 +44,12 @@ async function getBrowser() {
     if (b && b.isConnected()) return b;
     browserPromise = null;
   }
-  browserPromise = chromium.launch({
-    headless: true,
-    args: ['--autoplay-policy=no-user-gesture-required', '--mute-audio'],
-  });
+  // `channel: 'chromium'` = full Chromium in the new headless mode. The old
+  // headless shell advertises "HeadlessChrome" in client hints, and some embed
+  // APIs (e.g. the 111Movies player API) silently return empty sources to it.
+  const opts = { headless: true, args: ['--autoplay-policy=no-user-gesture-required', '--mute-audio'] };
+  if (process.env.RESOLVER_HEADLESS_SHELL !== '1') opts.channel = 'chromium';
+  browserPromise = chromium.launch(opts).catch(() => chromium.launch({ headless: true, args: opts.args }));
   return browserPromise;
 }
 
@@ -60,6 +62,21 @@ function looksLikeHls(url, contentType) {
 function isJunk(url) {
   return /doubleclick|googlesyndication|analytics|sentry|adsco|adserv/i.test(url);
 }
+
+// Some players never request the m3u8 by URL: they fetch a JSON source list and
+// build a blob: playlist in JS. Scan small JSON/text XHR bodies for an https
+// .m3u8 URL so those hosts still resolve. Returns the first plausible URL.
+const M3U8_IN_TEXT = /https?:(?:\\?\/){2}[^"'\s<>]+?\.m3u8(?:\?[^"'\s<>]*)?/i;
+function m3u8FromBody(text) {
+  if (!text || text.length > 2_000_000) return null;
+  const m = text.match(M3U8_IN_TEXT);
+  if (!m) return null;
+  const url = m[0].replace(/\\\//g, '/').replace(/\\u0026/g, '&');
+  return isJunk(url) ? null : url;
+}
+
+// Client-hint brands that don't say "HeadlessChrome".
+const SEC_CH_UA = '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"';
 
 // Try clicking whatever looks like a play control, then the page center.
 async function pokePlay(page) {
@@ -89,6 +106,10 @@ async function sniff(embedUrl) {
     userAgent: UA,
     viewport: { width: 1280, height: 720 },
     locale: 'en-US',
+    extraHTTPHeaders: { 'sec-ch-ua': SEC_CH_UA, 'sec-ch-ua-mobile': '?0', 'sec-ch-ua-platform': '"macOS"' },
+  });
+  await ctx.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
   // New tabs (popup ads) get closed immediately.
   ctx.on('page', (p) => { if (p.url() !== 'about:blank') p.close().catch(() => {}); });
@@ -103,11 +124,21 @@ async function sniff(embedUrl) {
       done({ url, referer: req.headers()['referer'] || embedUrl });
     }
   });
-  page.on('response', (resp) => {
+  page.on('response', async (resp) => {
     const url = resp.url();
     if (isJunk(url)) return;
-    if (looksLikeHls(url, resp.headers()['content-type'])) {
-      done({ url, referer: resp.request().headers()['referer'] || embedUrl });
+    const ct = resp.headers()['content-type'] || '';
+    if (looksLikeHls(url, ct)) {
+      return done({ url, referer: resp.request().headers()['referer'] || embedUrl });
+    }
+    // JSON source APIs (fetch/xhr) that carry the m3u8 URL in their body.
+    const rt = resp.request().resourceType();
+    if ((rt === 'xhr' || rt === 'fetch') && /json|text\/plain|javascript/i.test(ct) && resp.status() < 400) {
+      const text = await resp.text().catch(() => '');
+      const hit = m3u8FromBody(text);
+      // The player fetches the playlist from its own page, so the page origin
+      // is the Referer the CDN expects.
+      if (hit) done({ url: hit, referer: resp.request().headers()['referer'] || embedUrl, fromBody: true });
     }
   });
 
@@ -139,7 +170,15 @@ async function resolve(embedUrl) {
     const t0 = Date.now();
     const hit = await sniff(embedUrl);
     if (!hit) return { err: 'no m3u8 observed' };
-    const value = { url: hit.url, referer: hit.referer, ms: Date.now() - t0 };
+    let origin;
+    try { origin = new URL(hit.referer).origin; } catch (e) { origin = undefined; }
+    // headers = what the CDN expects on the playlist AND every segment.
+    const value = {
+      url: hit.url,
+      referer: hit.referer,
+      headers: { Referer: hit.referer, ...(origin ? { Origin: origin } : {}), 'User-Agent': UA },
+      ms: Date.now() - t0,
+    };
     cacheSet(embedUrl, value);
     return value;
   })().finally(() => inflight.delete(embedUrl));

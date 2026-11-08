@@ -8,9 +8,9 @@
 //   anime:as:<slug>                  → anisuge anime (meta lists episodes)
 //   anime:as:<slug>:<episodeId>:<sub|dub>  → an episode stream
 //   anime:nx:<uuid>:<slug>           → anime.nexus catalog item (meta best-effort)
-const { getText, getJson } = require('../lib/http');
+const { getText, getJson, UA } = require('../lib/http');
 const cache = require('../lib/cache');
-const { proxUrl } = require('../lib/proxy');
+const direct = require('../lib/direct');
 
 const AS = 'https://anisuge.tv';
 const NX = 'https://api.anime.nexus';
@@ -25,12 +25,21 @@ function handlesCatalog(id) {
   return id === 'anisuge.trending' || id === 'animenexus.popular';
 }
 
+function decodeEntities(str) {
+  return String(str || '')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&quot;/g, '"').replace(/&#039;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
 // ---- anisuge catalog: parse /filter or /home cards --------------------------
 function parseAnisugeCards(html) {
   const out = [];
-  // Card anchor: <a class="poster..." href="https://anisuge.tv/watch/<slug>[/ep-N]"
+  // Card anchor (path was /watch/ until ~Oct 2026, now /anime/):
+  //   <a class="poster..." href="https://anisuge.tv/anime/<slug>[/ep-N]"
   //   data-tip="<animeId>"> ... <img ... data-src="<poster>" alt="<title>">
-  const re = /href="(?:https?:\/\/[^/]+)?\/watch\/([^"?#]+?)"[^>]*?(?:data-tip="(\d+)")?[^>]*>[\s\S]{0,300}?<img[^>]*?(?:data-src|src)="([^"]+)"[^>]*?alt="([^"]*)"/g;
+  const re = /href="(?:https?:\/\/[^/]+)?\/(?:watch|anime)\/([^"?#]+?)"[^>]*?(?:data-tip="(\d+)")?[^>]*>[\s\S]{0,300}?<img[^>]*?(?:data-src|src)="([^"]+)"[^>]*?alt="([^"]*)"/g;
   let m;
   const seen = new Set();
   while ((m = re.exec(html)) && out.length < 40) {
@@ -39,7 +48,7 @@ function parseAnisugeCards(html) {
     seen.add(slug);
     const animeId = m[2];
     const poster = m[3];
-    const name = (m[4] || slug.replace(/-/g, ' ')).trim();
+    const name = decodeEntities(m[4] || slug.replace(/-/g, ' ')).trim();
     // Carry animeId in the id when present so meta can skip re-scraping the id.
     out.push({ id: `anime:as:${slug}${animeId ? '~' + animeId : ''}`, type: 'anime', name, poster, posterShape: 'poster' });
   }
@@ -91,21 +100,25 @@ function extractAnimeId(html) {
 
 async function anisugeEpisodes(slug, knownAnimeId) {
   return cache.wrap(`as:eps:${slug}`, 15 * 60 * 1000, async () => {
-    const page = await getText(`${AS}/watch/${slug}`);
+    const page = await getText(`${AS}/anime/${slug}`);
     const animeId = knownAnimeId || extractAnimeId(page);
-    const title = (page.match(/<h1[^>]*>([^<]+)<\/h1>/) || [])[1];
+    const title = decodeEntities((page.match(/<h1[^>]*>([^<]+)<\/h1>/) || [])[1] || '');
     const poster = (page.match(/<img[^>]+class="[^"]*poster[^"]*"[^>]+src="([^"]+)"/) || [])[1];
     if (!animeId) return { title, poster, episodes: [] };
     const j = await getJson(`${AS}/ajax/episode/list/${animeId}`, { headers: AJAX });
     const frag = (j && j.result) || '';
     const eps = [];
-    const re = /data-id="(\d+)"[^>]*(?:data-number="(\d+)")?[^>]*>[\s\S]{0,120}?(?:title="([^"]+)"|>\s*([^<]+?)\s*<)/g;
+    // <a href="#" data-id="135652" title="Episode 1" data-num="Episode 1"
+    //    data-slug="1" data-sub="1" data-dub="1" data-ids="…">
+    const re = /<a\b[^>]*\bdata-id="(\d+)"[^>]*>/g;
     let m;
     while ((m = re.exec(frag))) {
+      const tag = m[0];
       const epId = m[1];
-      const num = m[2] || String(eps.length + 1);
-      const epTitle = (m[3] || m[4] || `Episode ${num}`).trim();
-      eps.push({ id: epId, number: parseInt(num, 10) || eps.length + 1, title: epTitle });
+      const attr = (n) => (tag.match(new RegExp(`\\b${n}="([^"]*)"`)) || [])[1];
+      const num = parseInt(attr('data-slug') || attr('data-number') || (attr('data-num') || '').replace(/\D+/g, ''), 10) || eps.length + 1;
+      const epTitle = decodeEntities(attr('data-jtitle') || attr('title') || `Episode ${num}`).trim();
+      eps.push({ id: epId, number: num, title: epTitle, dub: attr('data-dub') === '1' });
     }
     return { title: title && title.trim(), poster, animeId, episodes: eps };
   });
@@ -145,20 +158,53 @@ async function meta(id) {
 }
 
 // ---- anisuge streams: episode blob → server list → embed → m3u8 -------------
+// Since ~Oct 2026 the megaplay-family getSources answer carries the source as
+// `enc` = base64url(AES-256-CBC(JSON {file})) instead of plain `sources`. The
+// key/IV are the player's public client constants (zero-padded to 32/16 bytes);
+// we decode the DATA here — no third-party script is executed. If they rotate,
+// we re-read the constants from the player's app.main.js once and retry.
+const crypto = require('crypto');
+const EMBED_KEYS = { key: 'i?LMTAx0Q6,:}50U', iv: "W0;27ToaUpl_P%'c" };
+const padBytes = (str, n) => { const b = Buffer.alloc(n); Buffer.from(str, 'utf8').copy(b, 0, 0, n); return b; };
+function decryptEnc(enc, keys) {
+  try {
+    const d = crypto.createDecipheriv('aes-256-cbc', padBytes(keys.key, 32), padBytes(keys.iv, 16));
+    return JSON.parse(Buffer.concat([d.update(Buffer.from(String(enc), 'base64url')), d.final()]).toString('utf8'));
+  } catch (e) { return null; }
+}
+async function refreshEmbedKeys(host) {
+  const js = await getText(`${host}/lib/app.main.js`).catch(() => '');
+  const k = js.match(/ENC_KEY\s*=\s*"([^"]+)"/);
+  const v = js.match(/ENC_IV\s*=\s*"([^"]+)"/);
+  if (k && v) { EMBED_KEYS.key = k[1]; EMBED_KEYS.iv = v[1]; return true; }
+  return false;
+}
+async function sourceFile(j, host) {
+  if (!j) return null;
+  const plain = (j.sources && (j.sources.file || (Array.isArray(j.sources) && j.sources[0] && j.sources[0].file))) || j.file;
+  if (plain) return plain;
+  if (!j.enc) return null;
+  let dec = decryptEnc(j.enc, EMBED_KEYS);
+  if (!dec && (await refreshEmbedKeys(host))) dec = decryptEnc(j.enc, EMBED_KEYS);
+  const src = dec && (dec.file || (dec.sources && (dec.sources.file || (Array.isArray(dec.sources) && dec.sources[0] && dec.sources[0].file))));
+  return src || null;
+}
+
 // Resolve any AnimeSuge-family embed host (vidtube.site / megaplay.buzz / …) to
-// its m3u8. They all expose /stream/getSources?id=<data-id-on-embed-page>.
+// its m3u8. They all expose /stream/getSources?id=<data-id-on-embed-page>; the
+// embed's own ?s= (CDN choice) is forwarded like the player does.
 async function resolveEmbed(embedUrl) {
   try {
     const html = await getText(embedUrl, { headers: { Referer: AS + '/' } });
     const dataId = (html.match(/data-id="([^"]+)"/) || [])[1];
-    const host = new URL(embedUrl).origin;
+    const u = new URL(embedUrl);
+    const host = u.origin;
     if (dataId) {
-      const j = await getJson(`${host}/stream/getSources?id=${dataId}`, {
+      const sParam = u.searchParams.get('s');
+      const j = await getJson(`${host}/stream/getSources?id=${dataId}${sParam ? `&s=${encodeURIComponent(sParam)}` : ''}`, {
         headers: { Referer: embedUrl, 'X-Requested-With': 'XMLHttpRequest' },
       });
-      const file =
-        (j && j.sources && (j.sources.file || (Array.isArray(j.sources) && j.sources[0] && j.sources[0].file))) ||
-        (j && j.file);
+      const file = await sourceFile(j, host);
       if (file) return { m3u8: file, tracks: (j && j.tracks) || [], host };
     }
     const inline = (html.match(/https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/) || [])[0];
@@ -172,7 +218,7 @@ async function resolveEmbed(embedUrl) {
 async function anisugeEpisodeBlob(slug, episodeId, knownAnimeId) {
   return cache.wrap(`as:blob:${slug}:${episodeId}`, 15 * 60 * 1000, async () => {
     let animeId = knownAnimeId;
-    if (!animeId) animeId = extractAnimeId(await getText(`${AS}/watch/${slug}`));
+    if (!animeId) animeId = extractAnimeId(await getText(`${AS}/anime/${slug}`));
     if (!animeId) return null;
     const j = await getJson(`${AS}/ajax/episode/list/${animeId}`, { headers: AJAX });
     const frag = (j && j.result) || '';
@@ -217,71 +263,62 @@ function parseServers(frag) {
   return servers;
 }
 
-// Read the top RESOLUTION from a master m3u8 for a quality label (e.g. "1080p").
-async function maxQuality(m3u8, ref) {
-  try {
-    const txt = await getText(m3u8, { headers: { Referer: ref, Origin: new URL(ref).origin } });
-    let best = 0;
-    const re = /RESOLUTION=\d+x(\d+)/g;
-    let m;
-    while ((m = re.exec(txt))) best = Math.max(best, parseInt(m[1], 10));
-    return best ? `${best}p` : 'HLS';
-  } catch (e) { return 'HLS'; }
+async function anisugeServers(slug, episodeId, knownAnimeId) {
+  return cache.wrap(`as:srv:${slug}:${episodeId}`, 10 * 60 * 1000, async () => {
+    const blob = await anisugeEpisodeBlob(slug, episodeId, knownAnimeId);
+    if (!blob) return [];
+    const sl = await getJson(`${AS}/ajax/server/list?servers=${encodeURIComponent(blob)}`, { headers: AJAX }).catch(() => null);
+    return parseServers((sl && sl.result) || '');
+  });
 }
 
+// PLAY-time: episode + audio type → { url: m3u8, headers, subs } (for /direct).
+// The m3u8 CDN is referer-locked to the EMBED host (megaplay/vidtube), not to
+// anisuge, so the headers come from the embed that produced it.
+async function resolveAnisuge({ s: slug, ep: episodeId, a: animeId, t: type = 'sub' } = {}) {
+  if (!slug || !episodeId) return null;
+  const servers = (await anisugeServers(slug, episodeId, animeId)).filter((sv) => sv.type === type);
+  for (const sv of servers.slice(0, 3)) {
+    const r = await getJson(`${AS}/ajax/server?get=${encodeURIComponent(sv.linkId)}`, { headers: AJAX }).catch(() => null);
+    const embed = r && r.result && (r.result.url || r.result.link);
+    if (!embed) continue;
+    const resolved = await resolveEmbed(embed);
+    if (!resolved || !resolved.m3u8) continue;
+    const origin = resolved.host || AS;
+    const subs = (resolved.tracks || [])
+      .filter((t) => t && t.file && /\.(vtt|srt|ass)(\?|$)/i.test(t.file) && (t.kind || '').toLowerCase() !== 'thumbnails')
+      .map((t) => ({ url: t.file, lang: subLang(t.label || t.language), name: t.label || t.language }));
+    // English first so players that pick the first track default to English.
+    subs.sort((x, y) => (x.lang === 'eng' ? -1 : 0) - (y.lang === 'eng' ? -1 : 0));
+    return { url: resolved.m3u8, headers: { Referer: origin + '/', Origin: origin, 'User-Agent': UA }, subs };
+  }
+  return null;
+}
+direct.register('anisuge', resolveAnisuge);
+
+// LIST-time: only the cheap server list (which audio types exist). Each type
+// becomes a signed /direct URL that resolves the embed when played; we warm
+// that resolve in the background so the click is instant.
 async function anisugeStreams(slug, episodeId, knownAnimeId, host, label) {
-  const out = [];
-  const blob = await anisugeEpisodeBlob(slug, episodeId, knownAnimeId);
-  if (!blob) return out;
-  const sl = await getJson(`${AS}/ajax/server/list?servers=${encodeURIComponent(blob)}`, { headers: AJAX }).catch(() => null);
-  const servers = parseServers((sl && sl.result) || '');
-  // Resolve at least one server PER type (sub AND dub) so the user can pick.
-  const byType = { sub: [], dub: [] };
-  for (const sv of servers) (byType[sv.type] || byType.sub).push(sv);
-  const seen = new Set();
-
-  const resolveType = async (type) => {
-    for (const sv of (byType[type] || []).slice(0, 3)) {
-      const r = await getJson(`${AS}/ajax/server?get=${encodeURIComponent(sv.linkId)}`, { headers: AJAX }).catch(() => null);
-      const embed = r && r.result && (r.result.url || r.result.link);
-      if (!embed) continue;
-      const resolved = await resolveEmbed(embed);
-      if (resolved && resolved.m3u8 && !seen.has(resolved.m3u8)) {
-        seen.add(resolved.m3u8);
-        const ref = (resolved.host || AS) + '/';
-        const proxied = (u) => (host ? proxUrl(host, u, ref) : u);
-        const quality = await maxQuality(resolved.m3u8, ref);
-        const tag = type === 'dub' ? 'DUB' : 'SUB';
-        const rawSubs = (resolved.tracks || [])
-          .filter((t) => t && t.file && /\.(vtt|srt|ass)(\?|$)/i.test(t.file) && (t.kind || '').toLowerCase() !== 'thumbnails')
-          .map((t, i) => ({ id: `as-${type}-${i}`, file: t.file, lang: subLang(t.label || t.language), name: t.label || t.language }));
-        // English first so players that pick the first track default to English.
-        rawSubs.sort((a, b) => (a.lang === 'eng' ? -1 : 0) - (b.lang === 'eng' ? -1 : 0));
-        const stream = {
-          // Subs ride inside the master playlist as native HLS renditions
-          // (injected by /proxy) — clients that ignore Stremio stream-level
-          // `subtitles` still get selectable subtitle tracks.
-          url: host
-            ? proxUrl(host, resolved.m3u8, ref, { subs: rawSubs.map((s) => ({ url: s.file, lang: s.lang, name: s.name })) })
-            : resolved.m3u8,
-          name: `Couch AIO\nAnisuge ${tag}`,
-          // Descriptive title: episode label + quality + audio track.
-          title: `${label ? label + '\n' : ''}${quality} · ${tag === 'DUB' ? 'English Dub' : 'Japanese + Subs'}`,
-          behaviorHints: { notWebReady: false, bingeGroup: `couch-aio-${slug}-${tag.toLowerCase()}` },
-        };
-        if (!host) stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: { Referer: ref, Origin: resolved.host || AS } } };
-        const subs = rawSubs.map((s) => ({ id: s.id, url: proxied(s.file), lang: s.lang }));
-        if (subs.length) stream.subtitles = subs;
-        return stream;
-      }
-    }
-    return null;
-  };
-
-  const [subStream, dubStream] = await Promise.all([resolveType('sub'), resolveType('dub')]);
-  if (subStream) out.push(subStream);
-  if (dubStream) out.push(dubStream);
-  return out;
+  const servers = await anisugeServers(slug, episodeId, knownAnimeId).catch(() => []);
+  const types = ['sub', 'dub'].filter((t) => servers.some((sv) => sv.type === t));
+  return types.map((type) => {
+    const payload = { s: slug, ep: episodeId, a: knownAnimeId || undefined, t: type };
+    if (host) direct.prefetch('anisuge', payload);
+    const tag = type === 'dub' ? 'DUB' : 'SUB';
+    return {
+      url: host ? direct.directUrl(host, 'anisuge', payload) : undefined,
+      name: `Couch AIO\nAnisuge ${tag}`,
+      title: `${label ? label + '\n' : ''}HLS · ${tag === 'DUB' ? 'English Dub' : 'Japanese + Subs'}`,
+      behaviorHints: {
+        notWebReady: true,
+        bingeGroup: `couch-aio-${slug}-${tag.toLowerCase()}`,
+        // The usual embed host; the /direct link already carries the right
+        // headers server-side, so this only helps header-capable clients.
+        proxyHeaders: { request: { Referer: 'https://megaplay.buzz/', Origin: 'https://megaplay.buzz', 'User-Agent': UA } },
+      },
+    };
+  }).filter((st) => st.url);
 }
 
 async function streams(id, host) {
@@ -316,14 +353,14 @@ async function cinemetaName(type, tt) {
 // can match across languages.
 function parseAnisugeSearch(html) {
   const out = [];
-  const re = /<a class="item" href="(?:https?:\/\/[^/]+)?\/watch\/([^"?#]+?)"[\s\S]*?data-jp="([^"]*)"[^>]*>([^<]*)<\/div>\s*(?:<div class="subname">([^<]*)<\/div>)?/g;
+  const re = /<a class="item" href="(?:https?:\/\/[^/]+)?\/(?:watch|anime)\/([^"?#]+?)"[\s\S]*?data-jp="([^"]*)"[^>]*>([^<]*)<\/div>\s*(?:<div class="subname">([^<]*)<\/div>)?/g;
   let m;
   const seen = new Set();
   while ((m = re.exec(html)) && out.length < 20) {
     const slug = m[1].replace(/\/ep-\d+.*$/, '');
     if (seen.has(slug)) continue;
     seen.add(slug);
-    out.push({ slug, jp: m[2] || '', name: (m[3] || '').trim(), subname: m[4] || '' });
+    out.push({ slug, jp: decodeEntities(m[2] || ''), name: decodeEntities(m[3] || '').trim(), subname: decodeEntities(m[4] || '') });
   }
   return out;
 }
@@ -365,7 +402,19 @@ async function imdbStreams(type, tt, season, episode, host) {
   }
   if (!cards.length) return [];
   // Match Cinemeta's title against any anisuge title variant (EN/romaji/alias).
-  const best = cards.find((c) => titleMatches(name, c));
+  // anisuge lists each season as its own title ("… Season 2"), so prefer the
+  // card for the requested season, and for S1 the card with no season tag.
+  const matches = cards.filter((c) => titleMatches(name, c));
+  if (!matches.length) return [];
+  const seasonOf = (c) => {
+    const txt = `${c.name} ${c.subname} ${c.slug}`.toLowerCase();
+    const m = txt.match(/season[\s-]*(\d+)|(\d+)(?:st|nd|rd|th)[\s-]*season/);
+    return m ? parseInt(m[1] || m[2], 10) : 1;
+  };
+  const isSide = (c) => /mini anime|recap|special|movie|ova\b|chibi/i.test(`${c.name} ${c.slug}`);
+  const want = type === 'movie' ? 1 : (season || 1);
+  const best = matches.find((c) => seasonOf(c) === want && !isSide(c)) ||
+    matches.find((c) => seasonOf(c) === want) || (want === 1 ? matches.find((c) => !isSide(c)) : null) || null;
   if (!best) return [];
   const info = await anisugeEpisodes(best.slug);
   const wantEp = type === 'movie' ? 1 : (episode || 1);

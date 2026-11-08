@@ -1,6 +1,6 @@
 {
   "name": "couch-aio-addon",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "All-in-one Stremio catalog addon: GlobeTV live TV, Ramoflix & WMovies (movies/TV), and anime (anisuge / anime.nexus). Zero dependencies.",
   "main": "lib/server.js",
   "scripts": {
