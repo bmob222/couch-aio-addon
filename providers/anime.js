@@ -388,6 +388,16 @@ async function anisugeSearchCards(keyword) {
   return parseAnisugeSearch(typeof html === 'string' ? html : '');
 }
 
+// The quick-search dropdown only returns ~5 cards and often misses the main
+// series of a big franchise (One Piece → only movies/specials). The full
+// /search page lists every title, so it backs up the dropdown.
+async function anisugeFullSearchCards(keyword) {
+  const html = await getText(`${AS}/search?keyword=${encodeURIComponent(keyword)}`).catch(() => '');
+  return parseAnisugeCards(html || '').map((c) => ({
+    slug: c.id.replace(/^anime:as:/, '').replace(/~\d+$/, ''), name: c.name, jp: '', subname: '',
+  }));
+}
+
 async function imdbStreams(type, tt, season, episode, host) {
   const name = await cinemetaName(type, tt);
   if (!name) return [];
@@ -400,6 +410,13 @@ async function imdbStreams(type, tt, season, episode, host) {
     cards = await anisugeSearchCards(kw);
     if (cards.some((c) => titleMatches(name, c))) break;
   }
+  const exactOf = (c) => [c.name, c.jp, ...(c.subname || '').split(';')].map(normalizeTitle).includes(normalizeTitle(name));
+  const isSide = (c) => /mini anime|recap|special|movie|film\b|\bova\b|chibi|episode of|\b3d\b/i.test(`${c.name} ${c.jp} ${c.slug}`);
+  if (type !== 'movie' && !cards.some((c) => exactOf(c) && !isSide(c))) {
+    const full = await anisugeFullSearchCards(words.slice(0, 5).join(' '));
+    const known = new Set(cards.map((c) => c.slug));
+    cards = cards.concat(full.filter((c) => !known.has(c.slug)));
+  }
   if (!cards.length) return [];
   // Match Cinemeta's title against any anisuge title variant (EN/romaji/alias).
   // anisuge lists each season as its own title ("… Season 2"), so prefer the
@@ -411,10 +428,13 @@ async function imdbStreams(type, tt, season, episode, host) {
     const m = txt.match(/season[\s-]*(\d+)|(\d+)(?:st|nd|rd|th)[\s-]*season/);
     return m ? parseInt(m[1] || m[2], 10) : 1;
   };
-  const isSide = (c) => /mini anime|recap|special|movie|ova\b|chibi/i.test(`${c.name} ${c.slug}`);
   const want = type === 'movie' ? 1 : (season || 1);
+  // Exact title matches first, so "One Piece" picks the series, not
+  // "One Piece: Dead End". A series request never falls back to a movie/special.
+  matches.sort((a, b) => Number(exactOf(b)) - Number(exactOf(a)));
   const best = matches.find((c) => seasonOf(c) === want && !isSide(c)) ||
-    matches.find((c) => seasonOf(c) === want) || (want === 1 ? matches.find((c) => !isSide(c)) : null) || null;
+    (type === 'movie' ? matches.find((c) => seasonOf(c) === want) : null) ||
+    (want === 1 && type !== 'movie' ? matches.find((c) => !isSide(c)) : null) || null;
   if (!best) return [];
   const info = await anisugeEpisodes(best.slug);
   const wantEp = type === 'movie' ? 1 : (episode || 1);
